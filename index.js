@@ -939,8 +939,16 @@ export default {
         }
 
         // WRITE 5: Done!
+        // Determine if this was a full completion or a partial (timed out) completion.
+        // Only mark as 'partial' if the integration phase was actually skipped or
+        // the output is concatenated drafts (not a real integrated result).
+        // If integration completed successfully, it's 'done' — even if verification
+        // was skipped due to wall time.
+        const completedIntegration = jobState.finalOutput && !jobState.teamNotes?.includes('timed out');
+        const finalStatus = completedIntegration ? 'done' : 'partial';
+
         await updateJob({
-          status: 'done',
+          status: finalStatus,
           currentPhase: null,
           result: jobState.finalOutput,
           teamNotes: jobState.teamNotes,
