@@ -9,6 +9,21 @@
 const API_BASE = 'https://openrouter.ai/api/v1';
 const WALL_TIME_LIMIT = 13 * 60 * 1000; // 13 minutes — save partial at 13, Cloudflare kills at 15
 
+// ── Structured logging ───────────────────────────────────────────
+// Emits JSON log lines that Cloudflare Workers captures automatically.
+// Viewable in the Workers dashboard under "Logs" → "Real-time Logs".
+// Each log includes: level, event, jobId, uid, duration, tokensUsed, etc.
+function logEvent(level, event, data = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,    // 'info' | 'warn' | 'error'
+    event,    // e.g. 'job.queued', 'phase.complete', 'job.done'
+    ...data,
+  };
+  const prefix = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
+  console.log(`${prefix} [FICASA] ${JSON.stringify(entry)}`);
+}
+
 const MODES = {
   vibe:    { name: 'Vibe Coding', temp: 0.7, maxTokens: 4000, integratorTokens: 8000, agentCount: 3, selfCritique: false, integrationLoops: 0, verify: true, prefer: 'fast' },
   serious: { name: 'Serious Work', temp: 0.55, maxTokens: 6000, integratorTokens: 12000, agentCount: 4, selfCritique: false, integrationLoops: 1, verify: true, prefer: 'balanced' },
@@ -977,6 +992,7 @@ export default {
         await env.FICASA_QUEUE.send({ jobId });
         // Store dedupe key so a retry within 60s returns the same jobId
         await storeDedupeKey(env, authUser.uid, mission, mode || 'serious', jobId);
+        logEvent('info', 'job.queued', { jobId, uid: authUser.uid, mode: mode || 'serious', missionLen: mission.length, modelPref: modelPreference || 'free-only' });
         return Response.json({ jobId, status: 'queued' }, { headers: corsH });
       }
 
@@ -1036,11 +1052,13 @@ export default {
       try {
         // Load job
         const raw = await env.FICASA_JOBS.get(jobId);
-        if (!raw) { message.ack(); continue; }
+        if (!raw) { logEvent('warn', 'job.notfound', { jobId }); message.ack(); continue; }
         const job = JSON.parse(raw);
 
         // Skip cancelled jobs (local execution finished first)
-        if (job.status === 'cancelled') { message.ack(); continue; }
+        if (job.status === 'cancelled') { logEvent('info', 'job.skipped_cancelled', { jobId }); message.ack(); continue; }
+
+        logEvent('info', 'job.started', { jobId, uid: job.uid, mode: job.mode, missionLen: job.mission?.length || 0 });
 
         // Helper: update job (batched — only 5 writes total)
         const updateJob = async (updates) => {
@@ -1209,8 +1227,21 @@ export default {
         });
 
         message.ack();
+        logEvent('info', 'job.done', {
+          jobId, uid: job.uid, status: finalStatus,
+          durationMs: Date.now() - startTime,
+          durationSec: Math.round((Date.now() - startTime) / 1000),
+          tokensUsed: jobState.tokensUsed,
+          agents: jobState.agents?.length || 0,
+          outputLen: jobState.finalOutput?.length || 0,
+          verified: jobState.verificationResult?.passed ? 'pass' : 'partial',
+        });
 
       } catch (err) {
+        logEvent('error', 'job.failed', {
+          jobId, uid: job.uid, error: err.message, stack: err.stack?.slice(0, 200),
+          durationSec: Math.round((Date.now() - startTime) / 1000),
+        });
         try {
           const raw = await env.FICASA_JOBS.get(jobId);
           if (raw) {
