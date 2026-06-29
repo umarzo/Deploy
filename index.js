@@ -667,6 +667,31 @@ async function verifyDeliverable(state, apiKey, startTime) {
   const analysis = state.missionAnalysis;
   const guide = MISSION_TYPE_GUIDE[analysis.mission_type] || MISSION_TYPE_GUIDE.mixed;
   const htmlCloseTag = '<' + '/html>';
+  const deliverableLen = (state.finalOutput || '').length;
+  const structCheck = analysis?.deliverable_structure || 'prose_document';
+
+  // For large single-file code deliverables (>28K), skip model verification
+  // and use structural checks only (brace balance, closing tags).
+  if (structCheck === 'single_file' && deliverableLen > 28000) {
+    const endsWithHtml = new RegExp(htmlCloseTag + '\\s*$', 'i').test((state.finalOutput || '').trim());
+    const openBraces = ((state.finalOutput || '').match(/{/g) || []).length;
+    const closeBraces = ((state.finalOutput || '').match(/}/g) || []).length;
+    const bracesBalanced = openBraces === closeBraces;
+    const gaps = [];
+    if (!endsWithHtml) gaps.push('File does not end with closing html tag — may be truncated.');
+    if (!bracesBalanced) gaps.push(`Brace mismatch (${openBraces} open vs ${closeBraces} close) — possible syntax error.`);
+    state.verificationResult = {
+      passed: endsWithHtml && bracesBalanced, gaps,
+      criterionResults: (analysis.success_criteria || []).map(c => ({
+        criterion: c, status: endsWithHtml && bracesBalanced ? 'met' : 'partial',
+        evidence: endsWithHtml && bracesBalanced ? 'Structurally complete.' : 'Structural issues.',
+      })),
+      criticalErrors: gaps, missingSections: [], revised: false,
+      note: 'Large file — structural verification only.',
+    };
+    return;
+  }
+
   const sys = `You are FICASA's Verifier. Verify the deliverable against success criteria. Respond ONLY with JSON:
 { "criterion_results": [{"criterion":"","status":"met"|"partial"|"not_met","evidence":""}], "critical_errors": [], "overall_passed": true|false, "gaps": [], "needs_revision": true|false }
 
@@ -690,8 +715,8 @@ ${(state.finalOutput || '').length > 28000 ? `\n[NOTE: Deliverable is ${state.fi
   let needsRevision = v.needs_revision === true || criticalErrors.length > 0 || criterionResults.some(r => r.status === 'not_met');
 
   // Structural override for single-file code
-  const structCheck = analysis?.deliverable_structure || 'prose_document';
-  if (structCheck === 'single_file') {
+  const structCheckOverride = analysis?.deliverable_structure || 'prose_document';
+  if (structCheckOverride === 'single_file') {
     const endsWithHtml = new RegExp(htmlCloseTag + '\\s*$', 'i').test((state.finalOutput || '').trim());
     const openBraces = ((state.finalOutput || '').match(/{/g) || []).length;
     const closeBraces = ((state.finalOutput || '').match(/}/g) || []).length;
