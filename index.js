@@ -1,4 +1,3 @@
-
 // FICASA Backend Worker
 
 export default {
