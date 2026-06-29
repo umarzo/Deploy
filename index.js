@@ -449,9 +449,10 @@ Mission: "${state.mission}". Teammate: ${target.role}. Draft:\n${target.draft}`;
     const modelId = attempt === 0 ? reviewer.model : (fallbackModel(reviewer.skill_tags, triedIds, state)?.id);
     if (!modelId) break;
     triedIds.add(modelId);
-    const result = await callLLM(modelId, [{ role: 'system', content: sys }, { role: 'user', content: 'Provide your review as JSON.' }], apiKey, { tag: 'review' });
+    const result = await callLLM(modelId, [{ role: 'system', content: sys }, { role: 'user', content: 'Provide your review as JSON.' }], apiKey, { tag: 'review', maxRetries: 2 });
     reviewer.status = 'done';
-    if (result.ok) {
+    // BUG FIX: check content is non-empty, not just result.ok
+    if (result.ok && result.content && result.content.trim()) {
       const p = extractJSON(result.content) || {};
       const scores = p.scores && typeof p.scores === 'object' ? p.scores : {};
       const validScores = ['correctness','completeness','clarity','depth','alignment'].reduce((acc, k) => { acc[k] = clamp(parseInt(scores[k]) || 4, 1, 5); return acc; }, {});
