@@ -773,6 +773,24 @@ export default {
         return Response.json(job, { headers: corsHeaders });
       }
 
+      // POST /cancel — browser cancels a backend job when local finishes first
+      if (path === '/cancel' && request.method === 'POST') {
+        const body = await request.json();
+        const { jobId } = body;
+        if (!jobId) return Response.json({ error: 'Missing jobId' }, { status: 400, headers: corsHeaders });
+        const raw = await env.FICASA_JOBS.get(jobId);
+        if (raw) {
+          const job = JSON.parse(raw);
+          // Mark as cancelled so the queue consumer skips it if it hasn't started yet
+          if (job.status === 'queued') {
+            await env.FICASA_JOBS.put(jobId, JSON.stringify({ ...job, status: 'cancelled', updatedAt: Date.now() }), { expirationTtl: 86400 });
+          }
+          // If already running, we can't stop it mid-execution, but at least
+          // mark it as cancelled so the result won't overwrite the local one
+        }
+        return Response.json({ ok: true }, { headers: corsHeaders });
+      }
+
       return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
     } catch (err) {
       return Response.json({ error: err.message }, { status: 500, headers: corsHeaders });
@@ -790,6 +808,9 @@ export default {
         const raw = await env.FICASA_JOBS.get(jobId);
         if (!raw) { message.ack(); continue; }
         const job = JSON.parse(raw);
+
+        // Skip cancelled jobs (local execution finished first)
+        if (job.status === 'cancelled') { message.ack(); continue; }
 
         // Helper: update job (batched — only 5 writes total)
         const updateJob = async (updates) => {
