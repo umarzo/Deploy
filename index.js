@@ -365,10 +365,10 @@ Mission: ${cleanMission}. Type: ${analysis.mission_type}. Team:\n${wsList}`;
   return workstreams.map((w, i) => ({ id: `s${i+1}`, title: w.role, purpose: w.mandate, owner_idx: i, key_points: [] }));
 }
 
-function autoAssemble(workstreams, outline) {
+function autoAssemble(workstreams, outline, state) {
   const used = new Set();
   return workstreams.map((ws, i) => {
-    const model = pickSpecialist(ws.skill_tags, used, jobState);
+    const model = pickSpecialist(ws.skill_tags, used, state);
     used.add(model.id);
     return {
       idx: i, role: ws.role, mandate: ws.mandate, skill_tags: ws.skill_tags, priority: ws.priority,
@@ -741,10 +741,159 @@ ${(state.finalOutput || '').length > 28000 ? `\n[NOTE: Deliverable is ${state.fi
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GLOBAL STATE (per-mission, reset each queue message)
+// SECURITY: Firebase ID token verification + CORS + rate limiting
 // ═══════════════════════════════════════════════════════════════
 
-let jobState = null; // Set at the start of each queue message processing
+// Allowed origins — scoped to known frontend hosts. Requests from
+// other origins are rejected at the CORS layer.
+// NOTE: CORS is browser-enforced only — the real security is the
+// Firebase ID token verification below. If you host the frontend on
+// a different domain, add it here.
+const ALLOWED_ORIGINS = [
+  'https://officialficasa.web.app',
+  'https://officialficasa.firebaseapp.com',
+  'https://axikora.me',
+  'https://www.axikora.me',
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+];
+
+function corsHeaders(request) {
+  const origin = request.headers.get('Origin') || '';
+  // Echo back the origin if it's in our allowlist; otherwise use the
+  // first allowed origin (browser will block the response anyway).
+  const allowed = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  return {
+    'Access-Control-Allow-Origin': allowed,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Vary': 'Origin',
+  };
+}
+
+// Input size limits — prevents abuse via oversized payloads
+const MAX_MISSION_LENGTH = 50000;      // 50K chars — generous, covers most use cases
+const MAX_TOTAL_PAYLOAD = 200000;      // 200K chars — includes models list, attachments, etc.
+const RATE_LIMIT_WINDOW_MS = 60_000;   // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 5;     // 5 submits per minute per user
+
+/**
+ * Verify a Firebase ID token using Firebase's public keys.
+ * Firebase tokens are JWTs signed with RS256; we verify the signature
+ * against Google's public certs (cached for 1 hour in KV).
+ *
+ * Returns { uid, email } on success, or null on failure.
+ *
+ * On Cloudflare Workers we use Web Crypto API (subtle) for RS256 verify.
+ */
+async function verifyFirebaseToken(idToken, env) {
+  if (!idToken) return null;
+  const parts = idToken.split('.');
+  if (parts.length !== 3) return null;
+
+  const [headerB64, payloadB64, sigB64] = parts;
+  let header, payload;
+  try {
+    header = JSON.parse(atob(headerB64));
+    payload = JSON.parse(atob(payloadB64));
+  } catch { return null; }
+
+  // Verify issuer + audience
+  if (payload.iss !== 'https://securetoken.google.com/officialficasa') return null;
+  if (payload.aud !== 'officialficasa') return null;
+
+  // Verify expiry (with 30s clock skew tolerance)
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp < now - 30) return null;
+  if (payload.auth_time > now + 30) return null;
+
+  // Fetch Google's public keys (cached in KV for 1 hour to avoid refetching)
+  let certs;
+  const cached = await env.FICASA_JOBS.get('firebase_certs_cache');
+  if (cached) {
+    try { certs = JSON.parse(cached); } catch { certs = null; }
+  }
+  if (!certs) {
+    const resp = await fetch('https://www.googleapis.com/service_accounts/v1/jk:securetoken@system.gserviceaccount.com');
+    if (!resp.ok) return null;
+    certs = await resp.json();
+    // Cache for 50 minutes (certs rotate every ~24h, but 50m is safe)
+    await env.FICASA_JOBS.put('firebase_certs_cache', JSON.stringify(certs), { expirationTtl: 3000 });
+  }
+
+  // Find the cert matching the token's kid
+  const kid = header.kid;
+  const certPem = certs[kid] || (certs.keys && certs.keys.find(k => k.kid === kid)?.pem);
+  if (!certPem) return null;
+
+  // Convert PEM public key to CryptoKey for verification
+  try {
+    // Extract the base64 DER from the PEM
+    const pemContents = certPem.replace(/-----BEGIN [A-Z ]+-----/g, '').replace(/-----END [A-Z ]+-----/g, '').replace(/\s/g, '');
+    const der = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey(
+      'spki', der,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false, ['verify']
+    );
+
+    // Verify signature
+    const data = new TextEncoder().encode(headerB64 + '.' + payloadB64);
+    const sig = Uint8Array.from(atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, data);
+    if (!valid) return null;
+  } catch (e) {
+    return null;
+  }
+
+  return { uid: payload.sub, email: payload.email || null };
+}
+
+/**
+ * Per-user rate limiting using KV. Returns true if the request is allowed,
+ * false if rate limit exceeded. Tracks a counter per uid in a 1-minute window.
+ */
+async function checkRateLimit(env, uid) {
+  const key = `rl:${uid}`;
+  const now = Date.now();
+  const raw = await env.FICASA_JOBS.get(key);
+  let entry = raw ? JSON.parse(raw) : { count: 0, windowStart: now };
+  // Reset window if it expired
+  if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry = { count: 0, windowStart: now };
+  }
+  entry.count++;
+  // Store with short TTL so the key auto-expires
+  await env.FICASA_JOBS.put(key, JSON.stringify(entry), { expirationTtl: 120 });
+  return entry.count <= RATE_LIMIT_MAX_REQUESTS;
+}
+
+/**
+ * Idempotency check — prevents duplicate job submissions.
+ * Uses a hash of (uid + mission + mode) as a dedupe key. If a job with
+ * the same key was submitted in the last 60 seconds, returns the existing
+ * jobId instead of creating a new one.
+ */
+async function dedupeKey(env, uid, mission, mode) {
+  const hashData = `${uid}:${mode}:${mission.slice(0, 500)}`;
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashData));
+  const hashHex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `dedupe:${uid}:${hashHex.slice(0, 32)}`;
+}
+
+async function checkDuplicate(env, uid, mission, mode) {
+  const key = await dedupeKey(env, uid, mission, mode);
+  const existing = await env.FICASA_JOBS.get(key);
+  if (existing) {
+    try { return JSON.parse(existing); } catch { return null; }
+  }
+  return null;
+}
+
+async function storeDedupeKey(env, uid, mission, mode, jobId) {
+  const key = await dedupeKey(env, uid, mission, mode);
+  await env.FICASA_JOBS.put(key, JSON.stringify({ jobId, ts: Date.now() }), { expirationTtl: 60 });
+}
 
 // ═══════════════════════════════════════════════════════════════
 // MAIN WORKER EXPORT
@@ -752,27 +901,68 @@ let jobState = null; // Set at the start of each queue message processing
 
 export default {
   async fetch(request, env) {
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
-    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+    const corsH = corsHeaders(request);
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsH });
 
     const url = new URL(request.url);
     const path = url.pathname;
 
     try {
+      // ── AUTH: Verify Firebase ID token on every request ──────────
+      // The browser sends Authorization: Bearer <idToken>. We verify it
+      // against Firebase's public keys. Unauthenticated requests are rejected.
+      // For sendBeacon requests (which can't set custom headers), the token
+      // is also accepted inside the JSON body as _authToken.
+      const authHeader = request.headers.get('Authorization') || '';
+      let idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
       // POST /submit — browser sends mission here
       if (path === '/submit' && request.method === 'POST') {
+        // ── Input size limit ───────────────────────────────────────
+        const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+        if (contentLength > MAX_TOTAL_PAYLOAD) {
+          return Response.json({ error: 'Payload too large. Mission + attachments must be under 200KB.' }, { status: 413, headers: corsH });
+        }
+
         const body = await request.json();
+
+        // sendBeacon fallback: if no Authorization header, read token from body
+        if (!idToken && body._authToken) {
+          idToken = body._authToken;
+          delete body._authToken;  // don't store this in the job record
+        }
+
+        const authUser = await verifyFirebaseToken(idToken, env);
+        if (!authUser) {
+          return Response.json({ error: 'Authentication required. Please log in.' }, { status: 401, headers: corsH });
+        }
+
         const { mission, apiKey, mode, modelPreference, freeModels, premiumModels, selectedPremiumModels, creditBalance, webSearch } = body;
 
-        if (!mission || !apiKey) return Response.json({ error: 'Missing mission or apiKey' }, { status: 400, headers: corsHeaders });
+        if (!mission || !apiKey) return Response.json({ error: 'Missing mission or apiKey' }, { status: 400, headers: corsH });
+        // Mission length limit
+        if (typeof mission !== 'string' || mission.length > MAX_MISSION_LENGTH) {
+          return Response.json({ error: `Mission too long (max ${MAX_MISSION_LENGTH} chars).` }, { status: 400, headers: corsH });
+        }
+
+        // ── Rate limit ─────────────────────────────────────────────
+        const allowed = await checkRateLimit(env, authUser.uid);
+        if (!allowed) {
+          return Response.json({ error: 'Rate limit exceeded. Please wait a minute before submitting again.' }, { status: 429, headers: corsH });
+        }
+
+        // ── Idempotency: check for duplicate submissions ───────────
+        const dupe = await checkDuplicate(env, authUser.uid, mission, mode || 'serious');
+        if (dupe) {
+          // Return the existing jobId instead of creating a duplicate
+          return Response.json({ jobId: dupe.jobId, status: 'queued', duplicate: true }, { headers: corsH });
+        }
 
         const jobId = crypto.randomUUID();
         const jobData = {
-          id: jobId, mission, apiKey, mode: mode || 'serious',
+          id: jobId,
+          uid: authUser.uid,  // track owner for status/cancel auth
+          mission, apiKey, mode: mode || 'serious',
           modelPreference: modelPreference || 'free-only',
           freeModels: freeModels || [], premiumModels: premiumModels || [],
           selectedPremiumModels: selectedPremiumModels || [],
@@ -785,41 +975,55 @@ export default {
 
         await env.FICASA_JOBS.put(jobId, JSON.stringify(jobData), { expirationTtl: 86400 });
         await env.FICASA_QUEUE.send({ jobId });
-        return Response.json({ jobId, status: 'queued' }, { headers: corsHeaders });
+        // Store dedupe key so a retry within 60s returns the same jobId
+        await storeDedupeKey(env, authUser.uid, mission, mode || 'serious', jobId);
+        return Response.json({ jobId, status: 'queued' }, { headers: corsH });
+      }
+
+      // For all other routes, verify token from header only
+      const authUser = await verifyFirebaseToken(idToken, env);
+      if (!authUser) {
+        return Response.json({ error: 'Authentication required. Please log in.' }, { status: 401, headers: corsH });
       }
 
       // GET /status?jobId=xxx — browser polls this
       if (path === '/status' && request.method === 'GET') {
         const jobId = url.searchParams.get('jobId');
-        if (!jobId) return Response.json({ error: 'Missing jobId' }, { status: 400, headers: corsHeaders });
+        if (!jobId) return Response.json({ error: 'Missing jobId' }, { status: 400, headers: corsH });
         const raw = await env.FICASA_JOBS.get(jobId);
-        if (!raw) return Response.json({ error: 'Job not found' }, { status: 404, headers: corsHeaders });
+        if (!raw) return Response.json({ error: 'Job not found' }, { status: 404, headers: corsH });
         const job = JSON.parse(raw);
+        // ── Authorization: only the job owner can view status ──────
+        if (job.uid && job.uid !== authUser.uid) {
+          return Response.json({ error: 'Not authorized to view this job.' }, { status: 403, headers: corsH });
+        }
         delete job.apiKey; // never send API key back to browser
-        return Response.json(job, { headers: corsHeaders });
+        delete job.uid;    // don't leak the owner uid either
+        return Response.json(job, { headers: corsH });
       }
 
       // POST /cancel — browser cancels a backend job when local finishes first
       if (path === '/cancel' && request.method === 'POST') {
         const body = await request.json();
         const { jobId } = body;
-        if (!jobId) return Response.json({ error: 'Missing jobId' }, { status: 400, headers: corsHeaders });
+        if (!jobId) return Response.json({ error: 'Missing jobId' }, { status: 400, headers: corsH });
         const raw = await env.FICASA_JOBS.get(jobId);
-        if (raw) {
-          const job = JSON.parse(raw);
-          // Mark as cancelled so the queue consumer skips it if it hasn't started yet
-          if (job.status === 'queued') {
-            await env.FICASA_JOBS.put(jobId, JSON.stringify({ ...job, status: 'cancelled', updatedAt: Date.now() }), { expirationTtl: 86400 });
-          }
-          // If already running, we can't stop it mid-execution, but at least
-          // mark it as cancelled so the result won't overwrite the local one
+        if (!raw) return Response.json({ error: 'Job not found' }, { status: 404, headers: corsH });
+        const job = JSON.parse(raw);
+        // ── Authorization: only the job owner can cancel ───────────
+        if (job.uid && job.uid !== authUser.uid) {
+          return Response.json({ error: 'Not authorized to cancel this job.' }, { status: 403, headers: corsH });
         }
-        return Response.json({ ok: true }, { headers: corsHeaders });
+        // Mark as cancelled so the queue consumer skips it if it hasn't started yet
+        if (job.status === 'queued') {
+          await env.FICASA_JOBS.put(jobId, JSON.stringify({ ...job, status: 'cancelled', updatedAt: Date.now() }), { expirationTtl: 86400 });
+        }
+        return Response.json({ ok: true }, { headers: corsH });
       }
 
-      return Response.json({ error: 'Not found' }, { status: 404, headers: corsHeaders });
+      return Response.json({ error: 'Not found' }, { status: 404, headers: corsH });
     } catch (err) {
-      return Response.json({ error: err.message }, { status: 500, headers: corsHeaders });
+      return Response.json({ error: err.message }, { status: 500, headers: corsH });
     }
   },
 
@@ -846,9 +1050,19 @@ export default {
           return updated;
         };
 
-        // Set up global state for this mission
+        // ── SECURITY: Scrub the raw API key from KV at-rest ────────
+        // We've loaded the key into memory (apiKeyObj below). Once we've
+        // started processing, there's no reason for the raw key to remain
+        // in the KV record. We replace it with a placeholder so the key
+        // is not exposed if KV is ever inspected.
+        if (job.apiKey) {
+          await updateJob({ apiKey: '[scrubbed]' });
+        }
+
+        // Set up LOCAL state for this mission (NOT module-level — concurrent
+        // queue batches in the same isolate would stomp on a shared global).
         const apiKeyObj = { key: job.apiKey, _mode: job.mode };
-        jobState = {
+        const jobState = {
           apiKey: job.apiKey,
           mode: job.mode || 'serious',
           modelPreference: job.modelPreference || 'free-only',
@@ -886,7 +1100,7 @@ export default {
         if (Date.now() - startTime > WALL_TIME_LIMIT) { await updateJob({ status: 'partial', result: 'Timed out during outline generation.' }); message.ack(); continue; }
         jobState.outline = outline;
         jobState.workstreams = ws;
-        jobState.agents = autoAssemble(ws, outline);
+        jobState.agents = autoAssemble(ws, outline, jobState);
 
         // WRITE 2: Planning done
         await updateJob({ currentPhase: 'execution', analysis: { mission_type: analysis.mission_type, audience: analysis.audience, success_criteria: analysis.success_criteria, deliverable_structure: analysis.deliverable_structure }, agentCount: ws.length });
