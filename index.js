@@ -28,6 +28,9 @@ const MODES = {
   vibe:    { name: 'Vibe Coding', temp: 0.7, maxTokens: 4000, integratorTokens: 8000, agentCount: 3, selfCritique: false, integrationLoops: 0, verify: true, prefer: 'fast' },
   serious: { name: 'Serious Work', temp: 0.55, maxTokens: 6000, integratorTokens: 12000, agentCount: 4, selfCritique: false, integrationLoops: 1, verify: true, prefer: 'balanced' },
   agentic: { name: 'Agentic Flow', temp: 0.4, maxTokens: 10000, integratorTokens: 16000, agentCount: 5, selfCritique: true, integrationLoops: 1, verify: true, prefer: 'deep' },
+  // MAX mode — state-of-the-art pipeline. Activated when the client sends
+  // mode: 'agentic' + maxPower: true in the /submit body.
+  agentic_max: { name: 'Agentic Flow MAX', temp: 0.3, maxTokens: 14000, integratorTokens: 24000, agentCount: 7, selfCritique: true, selfCritiquePasses: 2, integrationLoops: 2, verify: true, prefer: 'deep', deepAnalysis: true, adversarialReview: true, coherenceAudit: true },
 };
 
 const MISSION_TYPE_GUIDE = {
@@ -952,7 +955,7 @@ export default {
           return Response.json({ error: 'Authentication required. Please log in.' }, { status: 401, headers: corsH });
         }
 
-        const { mission, apiKey, mode, modelPreference, freeModels, premiumModels, selectedPremiumModels, creditBalance, webSearch } = body;
+        const { mission, apiKey, mode, maxPower, modelPreference, freeModels, premiumModels, selectedPremiumModels, creditBalance, webSearch } = body;
 
         if (!mission || !apiKey) return Response.json({ error: 'Missing mission or apiKey' }, { status: 400, headers: corsH });
         // Mission length limit
@@ -974,10 +977,12 @@ export default {
         }
 
         const jobId = crypto.randomUUID();
+        // Resolve the effective mode: if maxPower is true and mode is agentic, use agentic_max
+        const effectiveMode = (maxPower && mode === 'agentic') ? 'agentic_max' : (mode || 'serious');
         const jobData = {
           id: jobId,
           uid: authUser.uid,  // track owner for status/cancel auth
-          mission, apiKey, mode: mode || 'serious',
+          mission, apiKey, mode: effectiveMode,
           modelPreference: modelPreference || 'free-only',
           freeModels: freeModels || [], premiumModels: premiumModels || [],
           selectedPremiumModels: selectedPremiumModels || [],
