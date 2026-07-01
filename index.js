@@ -48,6 +48,29 @@ const MISSION_TYPE_GUIDE = {
 
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
+// ── Live event log ─────────────────────────────────────────────
+// Lightweight, human-readable breadcrumbs pushed onto jobState.events
+// as the pipeline runs. These are REAL events (not simulated) describing
+// what each agent/orchestrator is actually doing, so the frontend can
+// render a live "mission feed" during long-running background jobs.
+// Kept small and capped so it's cheap to store/serialize into KV.
+// NOTE: this brings total KV writes per job from ~5 to roughly ~15-20
+// (one extra write per agent draft/review completion). Still cheap at
+// single-job volume; if job concurrency ever gets very high, consider
+// throttling these to e.g. one write per 2-3 agent completions.
+const MAX_EVENTS = 60;
+function pushEvent(state, evt) {
+  if (!state.events) state.events = [];
+  state.events.push({ t: Date.now(), ...evt });
+  if (state.events.length > MAX_EVENTS) state.events = state.events.slice(-MAX_EVENTS);
+}
+function agentSnapshot(state) {
+  return (state.agents || []).map(a => ({
+    idx: a.idx, role: a.role, model: a.model, status: a.status || 'idle',
+    mandate: a.mandate ? a.mandate.slice(0, 90) : '', chars: a.draft?.length || 0,
+  }));
+}
+
 function cleanOutput(text) {
   if (!text) return '';
   let t = text;
@@ -886,6 +909,7 @@ RULES:
 
 async function draftAgent(agent, state, apiKey, startTime) {
   agent.status = 'working'; agent.startedAt = Date.now();
+  pushEvent(state, { kind: 'agent.start', role: agent.role, model: agent.model, mandate: agent.mandate });
   const AGENT_DEADLINE_MS = 3 * 60 * 1000;
   const deadlineExceeded = () => (Date.now() - agent.startedAt) > AGENT_DEADLINE_MS || (Date.now() - startTime) > WALL_TIME_LIMIT;
 
@@ -906,8 +930,8 @@ async function draftAgent(agent, state, apiKey, startTime) {
   const messages = [{ role: 'system', content: sys }, { role: 'user', content: `Begin your work on: "${state.mission}"` }];
   const draftResult = await callWithFallbacks(agent, messages, state, apiKey, { tag: agent.role, stream: false, maxFallbacks: 2 });
 
-  if (!draftResult.ok && draftResult.fatal) { agent.status = 'error'; agent.error = draftResult.error; return; }
-  if (!draftResult.ok || !draftResult.content?.trim()) { agent.status = 'error'; agent.error = draftResult.error || 'All fallbacks exhausted'; return; }
+  if (!draftResult.ok && draftResult.fatal) { agent.status = 'error'; agent.error = draftResult.error; pushEvent(state, { kind: 'agent.error', role: agent.role, model: agent.model, error: draftResult.error }); return; }
+  if (!draftResult.ok || !draftResult.content?.trim()) { agent.status = 'error'; agent.error = draftResult.error || 'All fallbacks exhausted'; pushEvent(state, { kind: 'agent.error', role: agent.role, model: agent.model, error: agent.error }); return; }
 
   agent.draft = cleanOutput(draftResult.content);
   agent.tokens = Math.max(1, Math.round(agent.draft.length / 4));
@@ -918,6 +942,7 @@ async function draftAgent(agent, state, apiKey, startTime) {
   const mode = MODES[state.mode] || MODES.serious;
   if (mode.selfCritique && agent.draft.length > 80 && agent.draft.length < 2500 && !deadlineExceeded()) {
     agent.status = 'refining';
+    pushEvent(state, { kind: 'agent.refine', role: agent.role, model: agent.model });
     const critiqueSys = `You are reviewing YOUR OWN draft as the ${agent.role}. Identify 2-5 improvements. Respond ONLY with JSON: { "issues": [""], "fixes": [""], "severity": "low"|"medium"|"high" }`;
     const critiqueRes = await callWithFallbacks(agent, [{ role: 'system', content: critiqueSys }, { role: 'user', content: 'Critique your draft as JSON.' }], state, apiKey, { tag: `${agent.role}-selfcritique`, stream: false, maxFallbacks: 1 });
     if (critiqueRes.ok && critiqueRes.content) {
@@ -937,11 +962,13 @@ async function draftAgent(agent, state, apiKey, startTime) {
   }
   agent.elapsed = Date.now() - agent.startedAt;
   agent.status = 'done';
+  pushEvent(state, { kind: 'agent.done', role: agent.role, model: agent.model, chars: agent.draft.length, ms: agent.elapsed });
 }
 
 async function reviewAgent(reviewer, target, state, apiKey) {
   if (!target.draft || reviewer.status === 'error') return;
   reviewer.status = 'reviewing';
+  pushEvent(state, { kind: 'agent.review_start', role: reviewer.role, model: reviewer.model, targetRole: target.role });
   const analysis = state.missionAnalysis;
   const guide = analysis ? (MISSION_TYPE_GUIDE[analysis.mission_type] || MISSION_TYPE_GUIDE.mixed) : null;
   const sys = `You are reviewing a teammate's work. Score on 5 dimensions (1-5 each): correctness, completeness, clarity, depth, alignment. Respond ONLY with JSON: { "scores": {"correctness":5,"completeness":5,"clarity":5,"depth":5,"alignment":5}, "notes": {}, "top_issues": [], "suggested_fixes": [], "overall_severity": "low"|"medium"|"high" }
@@ -970,6 +997,7 @@ Mission: "${state.mission}". Teammate: ${target.role}. Draft:\n${target.draft}`;
         suggested_fixes: Array.isArray(p.suggested_fixes) ? p.suggested_fixes.map(String).slice(0, 5) : [],
         severity,
       };
+      pushEvent(state, { kind: 'agent.review_done', role: reviewer.role, targetRole: target.role, severity, minScore });
       return;
     }
     if (result.fatal) return;
@@ -982,8 +1010,10 @@ async function runIntegration(state, apiKey, startTime) {
   if (!successfulAgents.length) {
     state.finalOutput = 'No agents produced output.';
     state.teamNotes = `All ${state.agents.length} agents failed.`;
+    pushEvent(state, { kind: 'orchestrator.integrate_start', note: 'no drafts available' });
     return;
   }
+  pushEvent(state, { kind: 'orchestrator.integrate_start', agentCount: successfulAgents.length, reviewed: state.agents.filter(a => a.reviewReceived).length });
   const analysis = state.missionAnalysis;
   const guide = analysis ? (MISSION_TYPE_GUIDE[analysis.mission_type] || MISSION_TYPE_GUIDE.mixed) : null;
   const mode = MODES[state.mode] || MODES.serious;
@@ -1169,6 +1199,7 @@ async function runIntegration(state, apiKey, startTime) {
   const { deliverable: finalDeliverable, notes: finalNotes } = extractDeliverable(bestContent);
   state.finalOutput = finalDeliverable;
   state.teamNotes = finalNotes;
+  pushEvent(state, { kind: 'orchestrator.integrate_done', chars: finalDeliverable.length });
 
   // Post-integration structural check (same as client-side)
   if (deliverableStructure === 'single_file') {
@@ -1187,6 +1218,7 @@ async function verifyDeliverable(state, apiKey, startTime) {
     state.verificationResult = { passed: true, gaps: [], criterionResults: [], revised: false };
     return;
   }
+  pushEvent(state, { kind: 'orchestrator.verify_start' });
   if (Date.now() - startTime > WALL_TIME_LIMIT) {
     state.verificationResult = { passed: true, gaps: [], criterionResults: [], revised: false, note: 'Skipped (wall time limit)' };
     return;
@@ -1266,6 +1298,7 @@ ${(state.finalOutput || '').length > 28000 ? `\n[NOTE: Deliverable is ${state.fi
   }
 
   state.verificationResult = { passed: revised ? true : passed, gaps, criterionResults, criticalErrors, revised };
+  pushEvent(state, { kind: 'orchestrator.verify_done', passed: state.verificationResult.passed, gapCount: gaps.length, revised });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1499,7 +1532,7 @@ export default {
           creditBalance: creditBalance || 0,
           webSearch: webSearch || false,
           status: 'queued', createdAt: Date.now(), updatedAt: Date.now(),
-          currentPhase: null, phases: [], result: null, error: null,
+          currentPhase: null, phases: [], result: null, error: null, events: [], agents: [],
           tokensUsed: 0, analysis: null, outline: null,
         };
 
@@ -1619,16 +1652,23 @@ export default {
         if (jobState.premiumModels.length) assignPremiumTiers([...jobState.freeModels, ...jobState.premiumModels]);
 
         // WRITE 1: Status → running
-        await updateJob({ status: 'running', currentPhase: 'planning' });
+        pushEvent(jobState, { kind: 'orchestrator.analyze_start' });
+        await updateJob({ status: 'running', currentPhase: 'planning', events: jobState.events });
 
         // ── PHASE 1: ANALYZE ──────────────────────────────────────
         const analysis = await analyzeMission(job.mission, jobState, apiKeyObj);
         if (Date.now() - startTime > WALL_TIME_LIMIT) { await updateJob({ status: 'partial', currentPhase: null, result: 'Timed out during analysis.', error: 'Wall time exceeded' }); message.ack(); continue; }
         jobState.missionAnalysis = analysis;
+        pushEvent(jobState, { kind: 'orchestrator.analyze_done', missionType: analysis.mission_type, audience: analysis.audience });
+        // WRITE 1b: share the freshly-classified mission + events immediately —
+        // this is the first real signal the user sees, often ~5-15s in.
+        await updateJob({ analysis: { mission_type: analysis.mission_type, audience: analysis.audience, success_criteria: analysis.success_criteria, deliverable_structure: analysis.deliverable_structure }, events: jobState.events });
 
         // ── PHASE 1b: DECOMPOSE ───────────────────────────────────
+        pushEvent(jobState, { kind: 'orchestrator.decompose_start' });
         const ws = await decompose(job.mission, analysis, jobState, apiKeyObj);
         if (Date.now() - startTime > WALL_TIME_LIMIT) { await updateJob({ status: 'partial', result: 'Timed out during decomposition.' }); message.ack(); continue; }
+        pushEvent(jobState, { kind: 'orchestrator.decompose_done', workstreamCount: ws.length });
 
         // ── PHASE 1c: OUTLINE ─────────────────────────────────────
         const outline = await generateOutline(job.mission, ws, analysis, jobState, apiKeyObj);
@@ -1636,12 +1676,17 @@ export default {
         jobState.outline = outline;
         jobState.workstreams = ws;
         jobState.agents = autoAssemble(ws, outline, jobState);
+        pushEvent(jobState, { kind: 'orchestrator.team_assembled', agents: jobState.agents.map(a => ({ role: a.role, model: a.model })) });
 
         // WRITE 2: Planning done
-        await updateJob({ currentPhase: 'execution', analysis: { mission_type: analysis.mission_type, audience: analysis.audience, success_criteria: analysis.success_criteria, deliverable_structure: analysis.deliverable_structure }, agentCount: ws.length });
+        await updateJob({ currentPhase: 'execution', analysis: { mission_type: analysis.mission_type, audience: analysis.audience, success_criteria: analysis.success_criteria, deliverable_structure: analysis.deliverable_structure }, agentCount: ws.length, events: jobState.events, agents: agentSnapshot(jobState) });
 
         // ── PHASE 2: DRAFT (parallel agents) ──────────────────────
-        // Run agents with concurrency (3 at a time)
+        // Run agents with concurrency (3 at a time). After each individual
+        // agent finishes (success or error), push a small KV write with the
+        // latest event log + agent snapshot so the frontend can show real
+        // live progress instead of one static "execution…" message for
+        // the whole (often longest) phase.
         const agentPromises = [];
         let nextAgent = 0;
         const runNext = async () => {
@@ -1649,6 +1694,7 @@ export default {
             const i = nextAgent++;
             if (Date.now() - startTime > WALL_TIME_LIMIT) break;
             await draftAgent(jobState.agents[i], jobState, apiKeyObj, startTime);
+            await updateJob({ currentPhase: 'execution', events: jobState.events, agents: agentSnapshot(jobState) });
           }
         };
         await Promise.all([runNext(), runNext(), runNext()]);
@@ -1732,7 +1778,7 @@ export default {
         }
 
         // WRITE 3: Execution done
-        await updateJob({ currentPhase: 'review' });
+        await updateJob({ currentPhase: 'review', events: jobState.events, agents: agentSnapshot(jobState) });
 
         // ── PHASE 3: REVIEW ───────────────────────────────────────
         const reviewPromises = [];
@@ -1740,7 +1786,9 @@ export default {
           const reviewer = jobState.agents[i];
           const target = jobState.agents[(i + 1) % jobState.agents.length];
           if (target.draft && reviewer.status !== 'error' && Date.now() - startTime < WALL_TIME_LIMIT) {
-            reviewPromises.push(reviewAgent(reviewer, target, jobState, apiKeyObj));
+            reviewPromises.push(reviewAgent(reviewer, target, jobState, apiKeyObj).then(() =>
+              updateJob({ currentPhase: 'review', events: jobState.events, agents: agentSnapshot(jobState) })
+            ));
           }
         }
         await Promise.all(reviewPromises);
@@ -1764,7 +1812,7 @@ export default {
         }
 
         // ── PHASE 4: INTEGRATE ────────────────────────────────────
-        await updateJob({ currentPhase: 'finalization' });
+        await updateJob({ currentPhase: 'finalization', events: jobState.events, agents: agentSnapshot(jobState) });
         if (Date.now() - startTime < WALL_TIME_LIMIT) {
           await runIntegration(jobState, apiKeyObj, startTime);
         } else {
@@ -1775,7 +1823,7 @@ export default {
         }
 
         // WRITE 4: Integration done
-        await updateJob({ currentPhase: 'verification', result: jobState.finalOutput?.slice(0, 500) + (jobState.finalOutput?.length > 500 ? '...' : '') });
+        await updateJob({ currentPhase: 'verification', result: jobState.finalOutput?.slice(0, 500) + (jobState.finalOutput?.length > 500 ? '...' : ''), events: jobState.events, agents: agentSnapshot(jobState) });
 
         // ── PHASE 5: VERIFY ───────────────────────────────────────
         if (Date.now() - startTime < WALL_TIME_LIMIT) {
@@ -1799,6 +1847,8 @@ export default {
           result: jobState.finalOutput,
           teamNotes: jobState.teamNotes,
           verification: jobState.verificationResult,
+          events: jobState.events,
+          agents: agentSnapshot(jobState),
           analysis: {
             mission_type: jobState.missionAnalysis?.mission_type,
             audience: jobState.missionAnalysis?.audience,
