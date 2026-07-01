@@ -395,8 +395,493 @@ function autoAssemble(workstreams, outline, state) {
       model: model.id, modelName: model.name || model.id,
       status: 'idle', draft: '', tokens: 0, reviewReceived: null, error: null,
       fallbackNote: null, elapsed: 0, selfCritique: null,
+      // SOTA additions for coverage tracking + token reallocation
+      failureReason: null,
+      coverageStatus: 'pending',           // 'pending' | 'covered' | 'partial' | 'missing'
+      reassignedSections: [],
+      compensationAgentIdx: null,           // idx of agent that took over this agent's sections
+      reallocatedBudget: 0,                 // extra tokens granted to a compensation agent
     };
   });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SOTA COVERAGE HELPERS
+// All four helpers below are pure functions of `state` and do NOT
+// touch the network. They are safe to call from any pipeline phase.
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Build a per-section coverage matrix from the current agent drafts.
+ * Returns:
+ *   {
+ *     sections:   [{ id, title, purpose, owner_idx, owner_status,
+ *                    drafted_chars, drafted_by, coverage }]   // 'covered' | 'partial' | 'missing'
+ *     missing_ids:[sectionIds...],
+ *     partial_ids:[sectionIds...],
+ *     orphan_ids: [sectionIds whose owner_idx is out-of-range],
+ *     failureMap: { sectionId -> originalOwnerIdx | 'orphan' }
+ *   }
+ *
+ * `coverage` is derived by detecting section-heading mentions in any
+ * surviving draft. This is intentionally fuzzy (substring scan) so it
+ * works for prose, single-file, and multi-file deliverables alike —
+ * the strict structural re-check happens later in verifyDeliverable.
+ */
+function buildCoverageMatrix(state) {
+  const outline = state.outline || [];
+  const agents = state.agents || [];
+  const draftsByOwner = new Map();   // owner_idx -> concatenated draft text
+  const draftsAll = [];              // [{ idx, role, draft }]
+  for (const a of agents) {
+    const txt = (a.draft || '').trim();
+    if (txt) {
+      draftsAll.push({ idx: a.idx, role: a.role, draft: txt });
+      draftsByOwner.set(a.idx, (draftsByOwner.get(a.idx) || '') + '\n' + txt);
+    }
+  }
+
+  const sections = [];
+  const missing_ids = [];
+  const partial_ids = [];
+  const orphan_ids = [];
+  const failureMap = {};
+
+  for (const s of outline) {
+    const ownerIdx = Number.isInteger(s.owner_idx) ? s.owner_idx : -1;
+    const owner = agents[ownerIdx];
+    const ownerStatus = owner ? owner.status : 'error';
+    const ownerDraft = (draftsByOwner.get(ownerIdx) || '').trim();
+
+    // Section-mention detection (case-insensitive). We check both the
+    // literal `## sN` heading and a normalized title substring so that
+    // agents who rephrased the heading still count.
+    const headingNeedle = (s.id || '').toLowerCase();
+    const titleNeedle = (s.title || '').toLowerCase().slice(0, 40);
+    const titleHasContent = titleNeedle && titleNeedle.length >= 4;
+
+    const ownerMentions = ownerDraft && (
+      ownerDraft.toLowerCase().includes(headingNeedle) ||
+      (titleHasContent && ownerDraft.toLowerCase().includes(titleNeedle))
+    );
+
+    // Any OTHER surviving agent who mentions this section (covers reassigned coverage)
+    const surrogateMention = draftsAll.find(d => d.idx !== ownerIdx && (
+      d.draft.toLowerCase().includes(headingNeedle) ||
+      (titleHasContent && d.draft.toLowerCase().includes(titleNeedle))
+    ));
+
+    let coverage = 'missing';
+    let drafted_by = null;
+    let drafted_chars = 0;
+
+    if (ownerMentions && ownerDraft.length >= 80) {
+      coverage = 'covered';
+      drafted_by = ownerIdx;
+      drafted_chars = ownerDraft.length;
+    } else if (surrogateMention) {
+      // A teammate covered it (or partial overlap)
+      coverage = surrogateMention.draft.length >= 80 ? 'covered' : 'partial';
+      drafted_by = surrogateMention.idx;
+      drafted_chars = surrogateMention.draft.length;
+    } else if (ownerMentions) {
+      coverage = 'partial';
+      drafted_by = ownerIdx;
+      drafted_chars = ownerDraft.length;
+    }
+
+    if (coverage === 'missing') {
+      missing_ids.push(s.id);
+      failureMap[s.id] = ownerIdx >= 0 ? ownerIdx : 'orphan';
+      if (ownerIdx < 0 || ownerIdx >= agents.length) orphan_ids.push(s.id);
+    } else if (coverage === 'partial') {
+      partial_ids.push(s.id);
+      // Also record the owner so planReassignment can bucket partial sections correctly
+      failureMap[s.id] = ownerIdx >= 0 ? ownerIdx : 'orphan';
+    }
+
+    sections.push({
+      id: s.id, title: s.title, purpose: s.purpose,
+      owner_idx: ownerIdx, owner_status: ownerStatus,
+      drafted_chars, drafted_by, coverage,
+    });
+  }
+
+  return { sections, missing_ids, partial_ids, orphan_ids, failureMap };
+}
+
+/**
+ * Semantic partial-failure detector.
+ *
+ * Three failure modes, in increasing subtlety:
+ *   1. hard       — agent.status === 'error' OR empty draft
+ *   2. ghost      — produced <30 chars of draft (model returned a refusal / preamble)
+ *   3. dropout    — agent succeeded overall but is MISSING >= 60% of its
+ *                   owned sections (silent section drop). Detected by
+ *                   counting how many of agent.ownedSections appear in
+ *                   agent.draft via the same mention-detection used in
+ *                   buildCoverageMatrix.
+ *
+ * Returns: {
+ *   hardFailures:   [agentIdx...],
+ *   ghostFailures:  [agentIdx...],
+ *   dropouts:       [agentIdx...],
+ *   byAgent:        { [agentIdx]: { modes: [...], details: [...] } }
+ * }
+ */
+function detectPartialFailures(state) {
+  const agents = state.agents || [];
+  const hardFailures = [];
+  const ghostFailures = [];
+  const dropouts = [];
+  const byAgent = {};
+
+  for (const a of agents) {
+    const draft = (a.draft || '').trim();
+    const modes = [];
+    const details = [];
+
+    // 1. Hard failure
+    if (a.status === 'error' || !draft) {
+      modes.push('hard');
+      details.push(a.error || 'no draft produced');
+      hardFailures.push(a.idx);
+    }
+
+    // 2. Ghost failure (tiny draft = refusal/preamble only)
+    if (a.status !== 'error' && draft && draft.length < 30) {
+      modes.push('ghost');
+      details.push(`draft only ${draft.length} chars (likely refusal/preamble)`);
+      ghostFailures.push(a.idx);
+    }
+
+    // 3. Silent section dropout
+    if (a.status !== 'error' && draft && draft.length >= 30 && (a.ownedSections || []).length) {
+      const hits = a.ownedSections.filter(s => {
+        const head = (s.id || '').toLowerCase();
+        const title = (s.title || '').toLowerCase().slice(0, 40);
+        const hasTitle = title && title.length >= 4;
+        const d = draft.toLowerCase();
+        return d.includes(head) || (hasTitle && d.includes(title));
+      });
+      const missing = a.ownedSections.length - hits.length;
+      const missingRatio = missing / a.ownedSections.length;
+      if (missingRatio >= 0.6) {
+        modes.push('dropout');
+        details.push(`${missing}/${a.ownedSections.length} owned sections missing from draft`);
+        dropouts.push(a.idx);
+      }
+    }
+
+    if (modes.length) byAgent[a.idx] = { modes, details };
+  }
+
+  return { hardFailures, ghostFailures, dropouts, byAgent };
+}
+
+/**
+ * Targeted reassignment planner.
+ *
+ * Given the failure list, produce a reassignment plan that prefers
+ * surviving agents with spare capacity (low draft size, high quality
+ * review) and degrades gracefully to "send everything to the integrator"
+ * if no surviving agent is available.
+ *
+ * Plan shape:
+ *   {
+ *     reassignments: [{ fromAgentIdx, toAgentIdx, sectionIds: [..], reason }],
+ *     integratorFallback: { sectionIds: [..] },     // sections the integrator must write from scratch
+ *     compensationLog:   [{ toAgentIdx, extraSections, reason }],
+ *   }
+ */
+function planReassignment(state, failures) {
+  const agents = state.agents || [];
+  const { sections, failureMap } = buildCoverageMatrix(state);
+
+  // Map failed-agent idx -> list of section IDs they were responsible for
+  const failedIdxToSections = new Map();
+  for (const sec of sections) {
+    if (sec.coverage === 'missing' || sec.coverage === 'partial') {
+      const origOwner = failureMap[sec.id];
+      if (origOwner === 'orphan') continue;
+      if (!failedIdxToSections.has(origOwner)) failedIdxToSections.set(origOwner, []);
+      failedIdxToSections.get(origOwner).push(sec.id);
+    }
+  }
+
+  // Also fold ghost + dropout failures (their sections may be present-but-shoddy)
+  for (const idx of [...failures.ghostFailures, ...failures.dropouts]) {
+    const a = agents[idx];
+    if (!a) continue;
+    const ownedIds = (a.ownedSections || []).map(s => s.id);
+    if (!failedIdxToSections.has(idx)) failedIdxToSections.set(idx, []);
+    for (const id of ownedIds) {
+      const arr = failedIdxToSections.get(idx);
+      if (!arr.includes(id)) arr.push(id);
+    }
+  }
+
+  // Candidate compensation agents: survivors, sorted by (draft length asc,
+  // then review severity asc — i.e. pick the least-loaded, highest-quality
+  // surviving agent first).
+  const survivors = agents.filter(a =>
+    a.status !== 'error' && (a.draft || '').trim().length >= 80 &&
+    !failures.hardFailures.includes(a.idx) && !failures.ghostFailures.includes(a.idx)
+  );
+  const sortedSurvivors = [...survivors].sort((a, b) => {
+    const aLen = (a.draft || '').length;
+    const bLen = (b.draft || '').length;
+    if (aLen !== bLen) return aLen - bLen;
+    const sev = (s) => ({ high: 0, medium: 1, low: 2, undefined: 3 }[s?.reviewReceived?.severity]);
+    return sev(a) - sev(b);
+  });
+
+  const reassignments = [];
+  const compensationLog = [];
+  const integratorSectionIds = [];
+  const perAgentLoad = new Map();   // agentIdx -> # reassigned sections
+  const MAX_EXTRA_SECTIONS = 5;     // capacity cap — prevents one survivor from being flooded
+
+  for (const [failedIdx, secIds] of failedIdxToSections.entries()) {
+    const reason = failures.byAgent[failedIdx]?.modes.join('+') || 'hard';
+    const failedAgent = agents[failedIdx];
+    const failedSkills = new Set(failedAgent?.skill_tags || []);
+
+    if (!sortedSurvivors.length) {
+      integratorSectionIds.push(...secIds);
+      continue;
+    }
+
+    // Assign each section to the best-scoring survivor.
+    // Score = skill-match bonus + spare-capacity bonus.
+    // Sections that can't be assigned (all survivors at capacity) fall to integrator.
+    for (let i = 0; i < secIds.length; i++) {
+      const candidates = sortedSurvivors
+        .map(s => {
+          const load = perAgentLoad.get(s.idx) || 0;
+          if (load >= MAX_EXTRA_SECTIONS) return null;  // capacity cap
+          const survivorSkills = new Set(s.skill_tags || []);
+          const skillMatch = [...failedSkills].some(sk => survivorSkills.has(sk));
+          const score = (skillMatch ? 10 : 0) + (MAX_EXTRA_SECTIONS - load);
+          return { survivor: s, score, load, skillMatch };
+        })
+        .filter(c => c !== null)
+        .sort((a, b) => b.score - a.score);
+
+      if (!candidates.length) {
+        // All survivors at capacity → integrator fallback
+        integratorSectionIds.push(secIds[i]);
+        continue;
+      }
+
+      const target = candidates[0].survivor;
+      perAgentLoad.set(target.idx, (perAgentLoad.get(target.idx) || 0) + 1);
+      reassignments.push({
+        fromAgentIdx: failedIdx,
+        toAgentIdx: target.idx,
+        sectionIds: [secIds[i]],
+        reason,
+      });
+      if (failedAgent) failedAgent.compensationAgentIdx = target.idx;
+    }
+  }
+
+  for (const [agentIdx, load] of perAgentLoad.entries()) {
+    const a = agents[agentIdx];
+    if (!a) continue;
+    const ids = reassignments.filter(r => r.toAgentIdx === agentIdx).flatMap(r => r.sectionIds);
+    a.reassignedSections = ids;
+    a.coverageStatus = ids.length ? 'compensating' : 'covered';
+    compensationLog.push({
+      toAgentIdx: agentIdx,
+      toAgentRole: a.role,
+      extraSections: ids.length,
+      sectionIds: ids,
+      reason: 'compensation for failed teammate',
+    });
+  }
+
+  return {
+    reassignments,
+    integratorFallback: { sectionIds: [...new Set(integratorSectionIds)] },  // dedup defensive
+    compensationLog,
+  };
+}
+
+/**
+ * Token budget reallocation.
+ *
+ * FICASA does NOT use hard per-agent token caps — each agent's
+ * `maxTokens` comes from the mode config and is enforced only inside
+ * callLLM. What we CAN reallocate is the "soft budget" used for
+ * downstream compensation passes: when an agent takes on extra sections,
+ * we bump its reallocatedBudget counter so the compensation pass can
+ * request a proportionally larger maxTokens when re-drafting those
+ * sections.
+ *
+ * Budget source: failed agents "release" their originally-planned
+ * budget. We redistribute it across the survivors who picked up their
+ * sections, proportional to extra section load.
+ *
+ * Mutates state.agents in place (sets `.reallocatedBudget`).
+ * Returns a summary object for logging.
+ */
+function reallocateTokenBudget(state, plan, failures) {
+  const mode = MODES[state.mode] || MODES.serious;
+  const baseBudget = mode.maxTokens || 4000;
+  const agents = state.agents || [];
+
+  // Total released budget = sum over failed agents of baseBudget
+  const failedIdxSet = new Set([
+    ...failures.hardFailures,
+    ...failures.ghostFailures,
+    ...failures.dropouts,
+  ]);
+  const releasedTotal = failedIdxSet.size * baseBudget;
+
+  // Count extra load per survivor
+  const extraByAgent = new Map();
+  for (const r of plan.reassignments) {
+    extraByAgent.set(r.toAgentIdx, (extraByAgent.get(r.toAgentIdx) || 0) + 1);
+  }
+  const totalExtra = [...extraByAgent.values()].reduce((a, b) => a + b, 0) || 1;
+
+  for (const a of agents) {
+    if (extraByAgent.has(a.idx)) {
+      const share = extraByAgent.get(a.idx) / totalExtra;
+      // Cap at 1.5x base budget — beyond that, extra tokens yield diminishing
+      // returns (the model can't effectively use 5x budget in one call).
+      // The 16000 hard cap in executeCompensationDrafts provides a second guard.
+      const cap = Math.round(baseBudget * 1.5);
+      a.reallocatedBudget = Math.min(Math.round(releasedTotal * share), cap);
+    } else {
+      a.reallocatedBudget = 0;
+    }
+  }
+
+  return {
+    releasedTotal,
+    redistributed: [...extraByAgent.entries()].map(([idx, n]) => ({
+      agentIdx: idx,
+      extraSections: n,
+      extraBudget: agents[idx]?.reallocatedBudget || 0,
+    })),
+  };
+}
+
+/**
+ * Execute the reassignment plan: ask each compensation agent to draft
+ * the sections it inherited from a failed teammate.
+ *
+ * Returns true if at least one compensation draft succeeded.
+ * Each surviving agent's draft is APPENDED (with a section separator)
+ * so the integrator sees both the original work and the compensation work.
+ */
+async function executeCompensationDrafts(state, plan, apiKey, startTime) {
+  const analysis = state.missionAnalysis;
+  const mode = MODES[state.mode] || MODES.serious;
+  let anySuccess = false;
+
+  // Track which sections were successfully compensated (for failed-agent audit trail)
+  const compensatedSections = new Set();
+  const failedCompSections = new Set();
+
+  // Group reassigned sections by target agent
+  const byTarget = new Map();   // agentIdx -> [{ fromAgentIdx, sectionIds, reason }]
+  for (const r of plan.reassignments) {
+    if (!byTarget.has(r.toAgentIdx)) byTarget.set(r.toAgentIdx, []);
+    byTarget.get(r.toAgentIdx).push(r);
+  }
+
+  for (const [agentIdx, items] of byTarget.entries()) {
+    if (Date.now() - startTime > WALL_TIME_LIMIT) break;
+    const agent = state.agents[agentIdx];
+    if (!agent || agent.status === 'error') continue;
+
+    const allSecIds = items.flatMap(r => r.sectionIds);
+    const sections = (state.outline || []).filter(s => allSecIds.includes(s.id));
+    if (!sections.length) continue;
+
+    const fromRoles = [...new Set(items.map(r =>
+      state.agents[r.fromAgentIdx]?.role || `agent#${r.fromAgentIdx}`))].join(', ');
+    const sectionsText = sections.map(s =>
+      `## ${s.id}. ${s.title}\nPurpose: ${s.purpose || '(unspecified)'}\nKey points: ${(s.key_points || []).map(p => `- ${p}`).join('\n') || '(none)'}`
+    ).join('\n\n');
+
+    const extraBudget = agent.reallocatedBudget || 0;
+    const compMaxTokens = Math.min(16000, (mode.maxTokens || 4000) + extraBudget);
+
+    const sys = `You are the ${agent.role} on FICASA. A teammate (${fromRoles}) FAILED to produce their assigned sections. You must produce those sections NOW so the deliverable is complete.
+
+MISSION: "${state.mission}"
+
+YOUR ASSIGNED SECTIONS (from failed teammate):
+${sectionsText}
+
+${analysis ? `MISSION CONTEXT: type=${analysis.mission_type}, audience=${analysis.audience || 'general'}, language=${analysis.primary_language || 'English'}` : ''}
+
+RULES:
+1. Produce ONLY the listed sections. Use Markdown ## headings with the exact section IDs.
+2. Be complete and specific — these sections have no other author.
+3. Write in ${analysis ? analysis.primary_language : 'English'}.
+4. No preamble, no commentary. Start directly with ## ${sections[0]?.id}.`;
+
+    agent.status = 'compensating';
+    const compMessages = [{ role: 'system', content: sys }, { role: 'user', content: `Begin your compensation work for the failed teammate (${fromRoles}).` }];
+    const compResult = await callWithFallbacks(agent, compMessages, state, apiKey, { tag: `${agent.role}-compensation`, stream: false, maxFallbacks: 2, maxTokens: compMaxTokens });
+
+    if (compResult.ok && compResult.content?.trim()) {
+      const compDraft = cleanOutput(compResult.content);
+      agent.draft = (agent.draft || '').trim() + '\n\n<!-- COMPENSATION: sections ' + allSecIds.join(', ') + ' -->\n\n' + compDraft;
+      agent.tokens = Math.max(agent.tokens || 0, Math.round(compDraft.length / 4));
+      state.tokensUsed += Math.round(compDraft.length / 4);
+      agent.fallbackNote = (agent.fallbackNote ? agent.fallbackNote + '; ' : '') + `compensated ${allSecIds.length} sections from ${fromRoles}`;
+      agent.coverageStatus = 'compensated';
+      allSecIds.forEach(id => compensatedSections.add(id));
+      anySuccess = true;
+    } else {
+      // Compensation attempt failed — log it; integrator fallback will pick up
+      agent.fallbackNote = (agent.fallbackNote ? agent.fallbackNote + '; ' : '') + `compensation failed for ${allSecIds.join(', ')}`;
+      agent.coverageStatus = 'compensation_failed';
+      allSecIds.forEach(id => failedCompSections.add(id));
+    }
+    agent.status = 'done';
+  }
+
+  // ── Update failed agents' coverageStatus for audit-trail consistency ──
+  // Map: failedIdx -> all section IDs that were reassigned from them
+  const failedIdxToOwnedSections = new Map();
+  for (const r of plan.reassignments) {
+    if (!failedIdxToOwnedSections.has(r.fromAgentIdx)) failedIdxToOwnedSections.set(r.fromAgentIdx, []);
+    failedIdxToOwnedSections.get(r.fromAgentIdx).push(...r.sectionIds);
+  }
+
+  for (const [failedIdx, secIds] of failedIdxToOwnedSections) {
+    const failedAgent = state.agents[failedIdx];
+    if (!failedAgent) continue;
+    const compensatedCount = secIds.filter(id => compensatedSections.has(id)).length;
+    if (compensatedCount === secIds.length) {
+      failedAgent.coverageStatus = 'compensated';
+    } else if (compensatedCount > 0) {
+      failedAgent.coverageStatus = 'partially_compensated';
+    } else {
+      failedAgent.coverageStatus = 'compensation_failed';
+    }
+  }
+
+  // Also mark failed agents whose sections went straight to integrator (no survivors)
+  for (const secId of plan.integratorFallback.sectionIds) {
+    // Find the original owner of this section
+    const outlineSec = (state.outline || []).find(s => s.id === secId);
+    if (!outlineSec) continue;
+    const ownerIdx = outlineSec.owner_idx;
+    const failedAgent = state.agents[ownerIdx];
+    if (failedAgent && (failedAgent.status === 'error' || !failedAgent.draft)) {
+      failedAgent.coverageStatus = 'integrator_fallback';
+    }
+  }
+
+  return anySuccess;
 }
 
 async function draftAgent(agent, state, apiKey, startTime) {
@@ -522,7 +1007,32 @@ async function runIntegration(state, apiKey, startTime) {
 
   const sys = `You are FICASA's Integrator. Merge the team's drafts into ONE cohesive deliverable for: "${cleanMission}"\n${structureRules}\n\nCRITICAL RULES:\n1. Every section from the outline MUST be present.\n2. Every teammate's contribution MUST be represented.\n3. Synthesize like a single expert author.\n4. Resolve contradictions.\n5. Address peer-review issues.\n6. No preamble, no commentary. Output the deliverable ONLY.\n7. Write in ${analysis ? analysis.primary_language : 'English'}.`;
 
-  const user = `Mission: ${cleanMission}\n\nTeam drafts:\n${draftsBlock}\n\nPeer reviews:\n${reviewsBlock || '(no reviews)'}\n\nProduce the final deliverable:`;
+  // SOTA: If the coverage-recovery phase identified sections that no
+  // agent produced (and that no compensation agent could cover either),
+  // explicitly instruct the integrator to write them from scratch.
+  // This is the last-resort backstop before the verifier's auto-revise.
+  const integratorFallbackSections = state.integratorFallbackSections || [];
+  const coverageRecovery = state.coverageRecovery;
+  let coverageDirective = '';
+  if (integratorFallbackSections.length) {
+    const missingSections = (state.outline || []).filter(s => integratorFallbackSections.includes(s.id));
+    const missingText = missingSections.map(s =>
+      `  - ${s.id}. ${s.title} — ${s.purpose || '(unspecified)'}${(s.key_points || []).length ? '\n      Key points: ' + s.key_points.map(p => p).join('; ') : ''}`
+    ).join('\n');
+    coverageDirective += `\n\n⚠️ COVERAGE DIRECTIVE — The following sections were NOT produced by any agent (teammate failures and compensation attempts both failed). You MUST write these sections YOURSELF from scratch, using the mission context. Do NOT skip them, do NOT mark them as "TODO", do NOT note that they are missing. Write them as if you were the original author:\n${missingText}\n\nThe deliverable is INCOMPLETE without these sections. Produce them in full.\n`;
+  }
+  if (coverageRecovery && coverageRecovery.compensationSucceeded) {
+    // Even when some sections needed integrator fallback, compensated sections
+    // still need extra coherence scrutiny. This is a separate concern from the
+    // directive above — both can fire simultaneously.
+    const compSections = (coverageRecovery.plan?.compensationLog || [])
+      .flatMap(c => c.sectionIds);
+    if (compSections.length) {
+      coverageDirective += `\n\nℹ️ COVERAGE NOTE — The following sections were written by compensation agents after the original owner failed: ${compSections.join(', ')}. Give them extra scrutiny for coherence with the rest of the deliverable.\n`;
+    }
+  }
+
+  const user = `Mission: ${cleanMission}\n\nTeam drafts:\n${draftsBlock}\n\nPeer reviews:\n${reviewsBlock || '(no reviews)'}${coverageDirective}\n\nProduce the final deliverable:`;
 
   let integratorMaxTokens = mode.integratorTokens || mode.maxTokens;
   if (deliverableStructure === 'single_file') integratorMaxTokens = Math.max(integratorMaxTokens, 16000);
@@ -1101,6 +1611,8 @@ export default {
           finalOutput: '',
           teamNotes: '',
           verificationResult: null,
+          coverageRecovery: null,           // SOTA — coverage recovery summary
+          integratorFallbackSections: [],   // SOTA — section IDs the integrator must write from scratch
         };
 
         // Assign premium tiers if premium models exist
@@ -1145,6 +1657,78 @@ export default {
         if (drafted === 0) {
           await updateJob({ status: 'error', error: 'All agents failed to produce output.' });
           message.ack(); continue;
+        }
+
+        // ── PHASE 2b: SOTA COVERAGE RECOVERY ─────────────────────
+        // After the parallel draft phase, detect partial failures, build a
+        // section-coverage matrix, reassign orphaned sections to surviving
+        // agents, reallocate token budgets, and execute compensation drafts.
+        // This runs BEFORE the review phase so that reviewers can also
+        // critique the compensation work.
+        const coverageMatrix = buildCoverageMatrix(jobState);
+        const failureReport = detectPartialFailures(jobState);
+        const totalFailures =
+          failureReport.hardFailures.length +
+          failureReport.ghostFailures.length +
+          failureReport.dropouts.length;
+        const hasUncoveredSections = coverageMatrix.missing_ids.length > 0 ||
+          coverageMatrix.partial_ids.length > 0;
+
+        let compensationSummary = null;
+        if ((totalFailures > 0 || hasUncoveredSections) && Date.now() - startTime < WALL_TIME_LIMIT - 120000) {
+          const reassignmentPlan = planReassignment(jobState, failureReport);
+          const budgetPlan = reallocateTokenBudget(jobState, reassignmentPlan, failureReport);
+          logEvent('warn', 'coverage.recovery.start', {
+            jobId, uid: job.uid,
+            failures: totalFailures,
+            hard: failureReport.hardFailures.length,
+            ghost: failureReport.ghostFailures.length,
+            dropout: failureReport.dropouts.length,
+            missingSections: coverageMatrix.missing_ids.length,
+            partialSections: coverageMatrix.partial_ids.length,
+            reassignments: reassignmentPlan.reassignments.length,
+            integratorFallbackSections: reassignmentPlan.integratorFallback.sectionIds.length,
+            budgetRedistributed: budgetPlan.releasedTotal,
+          });
+          const compOk = await executeCompensationDrafts(jobState, reassignmentPlan, apiKeyObj, startTime);
+          // Rebuild matrix after compensation to record final coverage
+          const postMatrix = buildCoverageMatrix(jobState);
+          compensationSummary = {
+            failures: failureReport,
+            plan: reassignmentPlan,
+            budget: budgetPlan,
+            postCompensationMissing: postMatrix.missing_ids,
+            postCompensationPartial: postMatrix.partial_ids,
+            compensationSucceeded: compOk,
+          };
+          logEvent('info', 'coverage.recovery.done', {
+            jobId,
+            stillMissing: postMatrix.missing_ids.length,
+            stillPartial: postMatrix.partial_ids.length,
+            compensationSucceeded: compOk,
+          });
+          // Save recovery info onto jobState for the integrator + log payload
+          jobState.coverageRecovery = compensationSummary;
+          // Push integrator-fallback sections into state so runIntegration
+          // can extend its prompt with them.
+          jobState.integratorFallbackSections = reassignmentPlan.integratorFallback.sectionIds;
+        } else if (totalFailures > 0 || hasUncoveredSections) {
+          // No time for compensation — at least record what's missing so
+          // the integrator prompt can be extended.
+          const reassignmentPlan = planReassignment(jobState, failureReport);
+          jobState.integratorFallbackSections = reassignmentPlan.integratorFallback.sectionIds;
+          jobState.coverageRecovery = {
+            failures: failureReport,
+            plan: reassignmentPlan,
+            budget: null,
+            postCompensationMissing: coverageMatrix.missing_ids,
+            postCompensationPartial: coverageMatrix.partial_ids,
+            compensationSucceeded: false,
+            skipped: 'wall_time',
+          };
+          logEvent('warn', 'coverage.recovery.skipped', {
+            jobId, reason: 'wall_time', missingSections: coverageMatrix.missing_ids.length,
+          });
         }
 
         // WRITE 3: Execution done
@@ -1222,9 +1806,25 @@ export default {
             deliverable_structure: jobState.missionAnalysis?.deliverable_structure,
           },
           tokensUsed: jobState.tokensUsed,
+          coverage: jobState.coverageRecovery ? {
+            recovered: true,
+            compensationSucceeded: jobState.coverageRecovery.compensationSucceeded,
+            skipped: jobState.coverageRecovery.skipped || null,
+            failuresDetected: {
+              hard: jobState.coverageRecovery.failures.hardFailures.length,
+              ghost: jobState.coverageRecovery.failures.ghostFailures.length,
+              dropout: jobState.coverageRecovery.failures.dropouts.length,
+            },
+            reassignments: jobState.coverageRecovery.plan.reassignments.length,
+            integratorFallbackSections: jobState.coverageRecovery.plan.integratorFallback.sectionIds,
+            stillMissing: jobState.coverageRecovery.postCompensationMissing,
+            stillPartial: jobState.coverageRecovery.postCompensationPartial,
+            budgetRedistributed: jobState.coverageRecovery.budget?.releasedTotal || 0,
+          } : { recovered: false, failuresDetected: { hard: 0, ghost: 0, dropout: 0 } },
           phases: [
             { name: 'planning', completedAt: startTime },
-            { name: 'execution', agents: jobState.agents.map(a => ({ role: a.role, model: a.model, status: a.status, chars: a.draft?.length || 0 })) },
+            { name: 'execution', agents: jobState.agents.map(a => ({ role: a.role, model: a.model, status: a.status, chars: a.draft?.length || 0, coverageStatus: a.coverageStatus, reassignedSections: a.reassignedSections, reallocatedBudget: a.reallocatedBudget })) },
+            { name: 'coverage_recovery', ran: !!jobState.coverageRecovery, succeeded: jobState.coverageRecovery?.compensationSucceeded || false },
             { name: 'review', reviewed: jobState.agents.filter(a => a.reviewReceived).length },
             { name: 'finalization', completedAt: Date.now() },
             { name: 'verification', result: jobState.verificationResult?.passed ? 'passed' : 'partial' },
